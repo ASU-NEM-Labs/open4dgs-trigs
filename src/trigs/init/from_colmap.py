@@ -805,7 +805,7 @@ def build_canonical_from_npz(
         fwd = torch.where(chain_valid & (offs > 0), offs, torch.zeros_like(offs)).amax(dim=1)
         bwd = torch.where(chain_valid & (offs < 0), -offs, torch.zeros_like(offs)).amax(dim=1)
         # Centre each row's window on its chain, at a keyframe offset so the new
-        # centre is a measured position (fred's girl at keyframe 193 chains 21
+        # centre is a measured position (the moving subject at keyframe 193 chains 21
         # frames back but ~3 forward), keeping the centre inside the clip.
         mu_frames = (times.squeeze(-1).cpu() * fps).round().long()
         last_frame = int(round(float(total_sec) * fps))

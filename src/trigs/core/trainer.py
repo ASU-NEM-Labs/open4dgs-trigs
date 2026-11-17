@@ -132,7 +132,7 @@ class TrigsTrainingConfig:
     #              a row at most K spacings within +/-1 sigma.
     init_sigma_t_mode: str = "npz"
     init_sigma_t_floor_frac: float = 0.4
-    # K = 3: on xr-lab-02's r05 init the still faces then start at p50 7.9
+    # K = 3: on example capture's r05 init the still faces then start at p50 7.9
     # frames (K = 1: 3.3), above the 6.0 r05 trained them to; fast rows stay
     # at the floor.
     init_sigma_t_speed_spacings: float = 3.0

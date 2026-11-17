@@ -1,0 +1,86 @@
+name: "Bug report"
+description: "Report an installation failure or reproducible problem in open4dgs-trigs."
+title: "[Bug]: "
+body:
+  -
+    type: "markdown"
+    attributes:
+      value: "Use this form for open4dgs-trigs. For the companion project, use https://github.com/ASU-NEM-Labs/open4dgs-core/issues. For security reports, follow [SECURITY.md](https://github.com/ASU-NEM-Labs/open4dgs-trigs/blob/main/SECURITY.md). Remove credentials, private paths, identifying camera metadata, and private footage before submitting."
+  -
+    type: "dropdown"
+    id: "area"
+    attributes:
+      label: "Affected workflow"
+      options:
+        - "Installation / CUDA build"
+        - "COLMAP / NPZ training"
+        - "PLY training"
+        - "SelfCap training"
+        - "Evaluation / export"
+        - "Viewer"
+        - "Other"
+    validations:
+      required: true
+  -
+    type: "input"
+    id: "versions"
+    attributes:
+      label: "Repository versions"
+      description: "Paste the commit SHA or release tag for both core and trainer. Use git rev-parse HEAD in each checkout."
+    validations:
+      required: true
+  -
+    type: "textarea"
+    id: "environment"
+    attributes:
+      label: "Environment"
+      description: "Include OS/version; native Linux, WSL 2 or Windows; GPU and VRAM; NVIDIA driver; CUDA toolkit (nvcc); Python, PyTorch, uv and relevant backend versions. Redact machine names and private paths."
+      value: "OS and version:\nWSL 2 (yes/no, version if applicable):\nGPU and VRAM:\nNVIDIA driver:\nCUDA toolkit (nvcc --version):\nPython / PyTorch / uv:\nConda or venv:\nRoMa / MEMFOF or other relevant versions:"
+    validations:
+      required: true
+  -
+    type: "textarea"
+    id: "reproduction"
+    attributes:
+      label: "Command and reproduction steps"
+      description: "Provide the exact command with sanitized paths, configuration changes, and the smallest reproduction you can share."
+      render: "shell"
+    validations:
+      required: true
+  -
+    type: "textarea"
+    id: "expected_actual"
+    attributes:
+      label: "Expected and actual behavior"
+      description: "Explain what you expected and what happened instead."
+    validations:
+      required: true
+  -
+    type: "textarea"
+    id: "logs"
+    attributes:
+      label: "Error output / logs"
+      description: "Paste relevant text including the first error and traceback. Remove secrets, private paths and identifying information."
+      render: "text"
+    validations:
+      required: false
+  -
+    type: "textarea"
+    id: "data"
+    attributes:
+      label: "Input description or public example"
+      description: "State dataset name (only if public), frame count, camera count, resolution, fps, masks, and initialization settings. Link only data you have permission to share; a private dataset is not required."
+    validations:
+      required: false
+  -
+    type: "checkboxes"
+    id: "checks"
+    attributes:
+      label: "Before submitting"
+      options:
+        -
+          label: "I searched existing issues and read the setup guide."
+          required: true
+        -
+          label: "I removed credentials and private or identifying information from this report."
+          required: true

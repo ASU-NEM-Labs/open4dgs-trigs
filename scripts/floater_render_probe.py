@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only render interventions for the unmasked fred-test-01 checkpoint.
+"""Read-only render interventions for the unmasked example capture checkpoint.
 
 Run with the training machine's trigs environment. Writes reports/images, never
 checkpoints. Source frames are inclusive and camera numbers are zero-based in
@@ -22,7 +22,7 @@ from scipy.spatial import cKDTree
 def select_ring(params, cameras, trainer, config, t, focal):
     """Handoff definition: visible, isolated, dynamic, near moving surface.
 
-    Units assume the reconstruction uses metres, as in fred-test-01. The
+    Units assume the reconstruction uses metres, as in example capture. The
     pixel scale uses the raw capture focal length and median camera distance.
     Neither a geometric surface oracle nor an occlusion-aware visibility test.
     """

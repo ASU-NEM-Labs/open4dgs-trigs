@@ -27,6 +27,33 @@ This trainer is based on [OpsiClear-4DGS/TriGSVanilla](https://github.com/OpsiCl
 
 ---
 
+## Release status and support
+
+This is an **initial research release**. Interfaces, defaults, and file formats may
+change as the project develops. The roadmap describes planned work without
+committed delivery dates.
+
+The main Linux setup was exercised on **Ubuntu 24.04, Python 3.11, CUDA 12.8,
+and an NVIDIA RTX 3090**. The trainer setup also documents a reported Windows
+11 / RTX PRO 6000 Blackwell configuration. These are specific tested or reported
+configurations, not a guarantee for every GPU or operating system. **WSL 2 has
+not yet been validated for this release.** See the setup guides for details.
+
+The split repositories have passed local dependency coverage checks and the
+trainer package builds successfully. A fresh end-to-end GPU run using only the
+split repositories has not yet been completed. Reconstruction quality, memory
+requirements, and runtime depend on the capture, masks, calibration, and GPU;
+large scenes may need substantial system RAM and GPU memory.
+
+Please use GitHub issues for reproducible bugs and installation problems. Include
+both repository versions, your environment, the command, and a redacted error
+log. Support is best effort; response times and feature delivery are not
+guaranteed. For suspected security problems, see [SECURITY.md](SECURITY.md).
+
+Example data will be published separately in
+[Open4DGS-Datasets](https://github.com/ASU-NEM-Labs/open4dgs-datasets); consult
+that repository for availability, instructions, and dataset licenses.
+
 ## Overview
 
 TRiGS reconstructs dynamic 3D Gaussian scenes by assigning each primitive a
@@ -365,18 +392,74 @@ Notes:
 - Pass `--no-sync` to `trigs-train-selfcap` to disable `optimized/sync.json`
   per-camera timing correction.
 
-### Watching a run in the viewer
+## Interactive trainer viewer
 
-Any training CLI can publish small params-only snapshots that
-`src/trigs/core/viewer.py` follows live (no restart, camera and UI state kept):
+The [trainer viewer](src/trigs/core/viewer.py) renders trained Gaussian scenes
+in a browser using `viser`, `nerfview`, and the CUDA `gsplat` renderer. It opens
+`.pt` checkpoints and training snapshots. To edit exported `.trigsbin` files,
+use the [customized SuperSplat editor](https://cmlapps.com/trigs-editor/).
+
+### Open a checkpoint
+
+Install the trainer environment first, activate it, and run from the
+`open4dgs-trigs` checkout root:
 
 ```bash
-# training: add to your usual command
---config.viewer-snapshot-every 1000 --config.viewer-snapshot-keep-last 3
-
-# viewer (needs CUDA; run it where the snapshots are, ideally on a second GPU)
-python src/trigs/core/viewer.py --watch <output_dir>/viewer_snapshots --port 8080
+python -m trigs.core.viewer \
+  --ckpt /path/to/run/trigs_ckpt.pt \
+  --port 8080 --device cuda
 ```
+
+Open **http://localhost:8080** in your browser. The Python process needs an
+NVIDIA CUDA GPU; the browser can run on a different machine. Keep the process
+running while viewing and press `Ctrl+C` in its terminal to stop it. With the
+package installed, the module command works from any directory. From the
+checkout, `python src/trigs/core/viewer.py` accepts the same options.
+
+Use **Frame** to scrub through time, **Auto Play** and **Play Speed (FPS)** for
+playback, and the viewport controls to move the camera. The UI also provides
+background color, static/dynamic visibility, opacity and scale controls, and
+diagnostic color modes for motion, duration, and opacity. Diagnostic controls
+change the display; they do not rewrite the checkpoint.
+
+Useful options:
+
+| Option | Purpose |
+| --- | --- |
+| `--fps 60 --total-frames 300` | Override playback metadata with your capture's values. Without metadata or overrides, the viewer falls back to 30 fps and 300 frames. |
+| `--t-start <SECONDS> --t-end <SECONDS>` | Override the displayed time range. |
+| `--temporal-threshold <VALUE>` | Match the run's `temporal_active_threshold` when comparing the viewer with training. The viewer CLI defaults to `0.05`; the current trainer default is `0.01`. |
+| `--no-spatial-filter` | Disable the display's spatial outlier filter if expected content is missing. |
+| `--no-precompute` | Disable the per-frame visibility cache to reduce memory use. |
+| `--device cuda:1` | Use a second GPU when available. |
+| `--npz-path /path/to/keyframes.npz` | Enable source-cohort diagnostics when the original NPZ remains row-aligned with the model; unnecessary for normal viewing. |
+
+Use the settings from the actual run, particularly for older checkpoints or
+runs with custom defaults. For all options, run
+`python -m trigs.core.viewer --help`.
+
+### Follow training as snapshots arrive
+
+Run the viewer in a separate terminal from training. For example, from the
+installed trainer environment:
+
+```bash
+trigs-train-colmap --data-dir /path/to/capture \
+  --npz-path /path/to/capture/keyframes.npz --output-dir /path/to/run \
+  --config.viewer-snapshot-every 1000 --config.viewer-snapshot-keep-last 3
+```
+
+```bash
+python -m trigs.core.viewer \
+  --watch /path/to/run/viewer_snapshots --port 8080 --device cuda
+```
+
+The viewer follows completed snapshots, preserving the camera and UI state;
+this is periodic snapshot viewing rather than a render of every training step.
+If there are no snapshots yet, it waits for the first one **before starting the
+browser server**. Snapshot output defaults to every 1,000 steps with the last
+three retained; `--config.viewer-snapshot-every 0` disables it. Use a second GPU
+when possible, since training and viewing otherwise share GPU memory.
 
 - Snapshots go to `<output_dir>/viewer_snapshots/` (override with
   `--config.viewer-snapshot-dir`); `latest.json` is replaced atomically after
@@ -394,6 +477,26 @@ python src/trigs/core/viewer.py --watch <output_dir>/viewer_snapshots --port 808
   `--no-precompute` also drops the per-frame visibility cache.
 - Snapshot cost is logged to TensorBoard (`viewer_snapshot/save_s`,
   `viewer_snapshot/bytes`).
+
+
+### View on a remote GPU machine
+
+Run the viewer on the GPU machine. From a terminal on your local computer,
+forward its port and leave the SSH connection open:
+
+```bash
+ssh -N -L 8080:localhost:8080 user@gpu-host
+```
+
+Then open **http://localhost:8080** locally. Use trusted machines and protect
+the server ports from public access; see [SECURITY.md](SECURITY.md).
+
+### Inspect initialization NPZ files
+
+The point-cloud NPZ viewer lives in **Open4DGS-Core**, at
+`prep/init/npz-viewer.py`. It shows the initialization before training, including
+velocity overlays and stage/detail-region previews, and does not require CUDA.
+See the [NPZ viewer instructions](https://github.com/ASU-NEM-Labs/open4dgs-core#npz-initialization-viewer).
 
 ---
 
