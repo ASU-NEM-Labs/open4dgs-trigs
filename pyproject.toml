@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trigs"
+version = "0.1.0"
+description = "TriGS: Temporally-Resolving Implicit Gaussian Splatting with coupled SE(3) motion and Bezier residuals"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+keywords = ["3dgs", "gaussian-splatting", "dynamic-scene-reconstruction", "4d", "selfcap", "trigs"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "setuptools>=61.0",
+    "wheel",
+    "gsplat",
+    "pytorch3d",
+    "gsply>=0.2.12",
+    "torchmetrics",
+    "tqdm",
+    "imageio",
+    "tyro>=0.8.8,<1.0",
+    "scipy>=1.10.0",
+    "torchvision>=0.15.0",
+    "opencv-python>=4.13.0.92",
+    "tensorboard>=2.20.0",
+    "pycolmap",
+    "viser",
+    "nerfview",
+    "matplotlib",
+    "splines",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "mypy>=1.10",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+trigs-train-plys = "trigs.cli.train_from_plys_upstream:main"
+trigs-train-colmap = "trigs.cli.train_from_colmap:main"
+trigs-train-selfcap = "trigs.cli.train_from_selfcap:main"
+trigs-export-plys = "trigs.cli.export_plys:main"
+trigs-eval = "trigs.cli.evaluate:main"
+trigs-eval-colmap = "trigs.cli.eval_colmap:main"
+
+[project.urls]
+Homepage = "https://github.com/ASU-NEM-Labs/open4dgs-trigs"
+Repository = "https://github.com/ASU-NEM-Labs/open4dgs-trigs"
+Issues = "https://github.com/ASU-NEM-Labs/open4dgs-trigs/issues"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+# Pin git sources to known-good commits so `uv sync` doesn't re-resolve
+# HEAD every time and cache invalidation stays predictable.
+gsplat = { git = "https://github.com/nerfstudio-project/gsplat.git", rev = "v1.5.3" }
+pytorch3d = { git = "https://github.com/facebookresearch/pytorch3d.git", rev = "v0.7.9" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# gsplat and pytorch3d don't declare their build-time deps in their
+# pyproject's `build-system.requires` (they expect torch/setuptools to be
+# pre-installed). We inject them here so uv's isolated builds succeed.
+# Requires `--preview-features extra-build-dependencies` on uv 0.8.x.
+[tool.uv.extra-build-dependencies]
+gsplat = ["setuptools>=61.0", "wheel", "ninja", "torch>=2.0.0", "numpy"]
+pytorch3d = ["setuptools>=61.0", "wheel", "ninja", "torch>=2.0.0", "numpy"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["trigs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "mypy>=1.10",
+    "ruff>=0.4",
+]
