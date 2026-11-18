@@ -25,6 +25,10 @@ dynamic 3D Gaussian Splatting.**
 
 This trainer is based on [OpsiClear-4DGS/TriGSVanilla](https://github.com/OpsiClear-4DGS/TriGSVanilla), an independent implementation of the TRiGS paper. It modifies and extends that project for this reconstruction pipeline. Credit goes to the TriGSVanilla contributors for their implementation and to the TRiGS authors for the method; see [Citations and credits](#citations-and-credits).
 
+One extension is **learned per-camera timing offsets**: the trainer can refine
+residual sub-frame synchronization errors jointly with scene reconstruction.
+This is opt-in; see [Learn camera timing offsets](#learn-camera-timing-offsets).
+
 ---
 
 ## Release status and support
@@ -50,9 +54,24 @@ both repository versions, your environment, the command, and a redacted error
 log. Support is best effort; response times and feature delivery are not
 guaranteed. For suspected security problems, see [SECURITY.md](SECURITY.md).
 
-Example data will be published separately in
-[Open4DGS-Datasets](https://github.com/ASU-NEM-Labs/open4dgs-datasets); consult
-that repository for availability, instructions, and dataset licenses.
+## Example datasets
+
+[Open4DGS-Datasets on Hugging Face](https://huggingface.co/datasets/asu-nem-labs/open4dgs-datasets)
+hosts two example captures: **example capture** (dance, 27 cameras) and
+**spidermen-01** (two performers in Spider-Man costumes, 45 cameras).
+Both include original camera videos with embedded timecode and separate
+alignment footage. Follow the dataset README and the
+[core preparation pipeline](https://github.com/ASU-NEM-Labs/open4dgs-core#pipeline)
+to extract frames, align cameras, and prepare training inputs. Downloads
+preserve the camera folder structure.
+
+The datasets use a separate license permitting **private, noncommercial
+evaluation and testing only**; this repository's AGPL license does not apply
+to them. Private scene-reconstruction
+training for evaluation is permitted. Sign in to Hugging Face and accept the
+dataset terms to obtain access. Sharing footage, renders, or reconstructed
+models requires prior written permission. See the dataset license for the
+full terms.
 
 ## Overview
 
@@ -353,6 +372,56 @@ bash scripts/run_colmap.sh \
     /path/to/per_frame_npys /path/to/colmap_data /path/to/output \
     0 61 5 0
 ```
+
+#### Learn camera timing offsets
+
+For imperfectly synchronized cameras, the trainer can optimize one constant
+time correction per training camera using the image reconstruction loss.
+The correction is added to that camera's existing capture times, allowing
+sub-frame refinement alongside the scene's motion parameters. These are
+**temporal offsets**, measured in seconds; they do not change camera poses.
+
+Enable refinement on the COLMAP training command with:
+
+```bash
+uv run --no-sync trigs-train-colmap \
+    --data-dir /path/to/colmap_data \
+    --output-dir /path/to/output \
+    --npz-path /path/to/keyframes.npz \
+    --timing-json /path/to/timing_candidate.json \
+    --config.n-steps 30000 \
+    --config.learn-camera-time-offsets
+```
+
+Start from the preparation pipeline's synchronization estimate. The COLMAP
+loader uses `frame_timestamps.json` when available, otherwise an explicit
+`--timing-json`, otherwise `sync.json`, and finally nominal frame times.
+Do not combine `frame_timestamps.json` with `--timing-json`; both define the
+capture-time baseline and the loader rejects that combination.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `--config.learn-camera-time-offsets` | Disabled | Enable temporal refinement. |
+| `--config.camera-time-offset-warmup-steps` | `8000` | Let the scene settle before learning offsets. |
+| `--config.lr-camera-time-offsets` | `0.0001` | Offset optimizer learning rate. |
+| `--config.lambda-camera-time-offset-reg` | `0.01` | Regularize corrections toward zero, preserving the initial timing estimate. |
+| `--config.camera-time-offset-clamp-s` | `0.0083` | Raw-parameter clamp scale in seconds, about half a frame at 60 fps. |
+
+The trainer clamps the raw offsets and then centers the effective corrections
+to zero mean, so it learns relative camera timing rather than a global shift
+of the sequence. The clamp value is not a strict bound on the corrections
+after centering. Runs that do not pass the warmup will not learn offsets.
+
+Optionally, `--config.camera-time-offset-observability-json /path/to/observability.json`
+uses the preparation tools' per-camera observability estimates to reduce
+corrections for cameras with weak timing evidence. Without it, all cameras
+use a scale of one.
+
+This feature refines small residual timing errors; it does not model clock
+drift across a sequence or the within-image timing variation of rolling
+shutter. Keep the appropriate rolling-shutter model enabled separately.
+Weak motion or inaccurate scene geometry can make timing difficult to infer,
+so compare reconstruction quality against a run with fixed timing.
 
 ### 3. SelfCap (4DV) mode
 
