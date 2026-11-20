@@ -213,6 +213,7 @@ set MAX_JOBS=16
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 set UV_CACHE_DIR=C:\uv-cache
+set DISTUTILS_USE_SDK=1
 uv venv --python 3.11 .venv
 uv pip install --python .venv\Scripts\python.exe ^
   --index-url https://download.pytorch.org/whl/cu128 ^
@@ -223,8 +224,11 @@ uv sync --locked --python 3.11 --preview-features extra-build-dependencies ^
 ```
 
 The non-isolated builds use the installed PyTorch rather than independently
-resolving a potentially different version. The short cache path can also avoid
-Windows path-length failures. The UTF-8 settings prevent a reported console
+resolving a potentially different version. `DISTUTILS_USE_SDK=1` lets the
+PyTorch extension builder use the Visual Studio environment that the prompt has
+already set up; without it, the PyTorch3D build stops with "the VC environment
+is activated but DISTUTILS_USE_SDK is not set". The short cache path can also
+avoid Windows path-length failures. The UTF-8 settings prevent a reported console
 encoding error in help output. For a persistent setting, configure the
 environment variables in Windows or set them in each terminal session.
 
