@@ -664,7 +664,15 @@ def _resolve_camera_key(
     """Match a training camera to a key in sync.json / frame_timestamps.json
     / observability.json. All three files share this key space (camera
     folder, e.g. "0000"), so every per-camera sync file uses this one
-    resolver instead of three near-duplicate lookups."""
+    resolver instead of three near-duplicate lookups.
+
+    When the camera folder is known, only the folder name (and its
+    zero-padded form) is a candidate. Position and camera-id indices are
+    zero-based while capture folders are commonly one-based, so using an
+    index as a fallback can silently give a camera that is absent from the
+    file a neighboring camera's entry. The prep lookup
+    (``_lookup_sync_offset_for_camera``) follows the same rule. Indices are
+    tried only when no folder is known."""
     candidates = []
 
     if folder is not None:
@@ -673,14 +681,14 @@ def _resolve_camera_key(
         # Directly map to padded folder name, no subtraction
         if folder_s.isdigit():
             candidates.append(f"{int(folder_s):04d}")
+    else:
+        # Parser/training position convention.
+        candidates.append(f"{int(cam_pos):04d}")
+        candidates.append(str(int(cam_pos)))
 
-    # Parser/training position convention.
-    candidates.append(f"{int(cam_pos):04d}")
-    candidates.append(str(int(cam_pos)))
-
-    # Original parser/COLMAP camera id convention LAST.
-    candidates.append(f"{int(orig_cam_id):04d}")
-    candidates.append(str(int(orig_cam_id)))
+        # Original parser/COLMAP camera id convention LAST.
+        candidates.append(f"{int(orig_cam_id):04d}")
+        candidates.append(str(int(orig_cam_id)))
 
     seen = set()
     for k in candidates:
