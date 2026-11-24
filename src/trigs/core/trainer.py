@@ -56,6 +56,15 @@ from .optimizer_state import (
     load_param_state,
     remap_param_with_sliced_state,
 )
+from .quality import (
+    apply_camera_appearance,
+    depth_distortion_loss,
+    depth_lambda_scale,
+    erode_mask,
+    opacity_binarization_loss,
+    resize_hw1,
+    split_mask_confidence,
+)
 from .viewer_snapshot import should_snapshot, write_viewer_snapshot
 from ..math.quaternion import quaternion_multiply, quaternion_to_rotmat
 from ..math.se3 import bezier_quadratic, bezier_rewindow, exp_se3_quat, gauge_fix_omega, tau_from_window
@@ -395,6 +404,55 @@ class TrigsTrainingConfig:
     lambda_alpha_outside_mask: float = 0.1
     lambda_alpha_mask: float = 0.5
     alpha_loss_eps: float = 1e-4
+    # Masks may carry a confidence channel (grey+alpha "LA" PNGs, alpha 0 =
+    # unknown; see trigs.core.quality.split_mask_confidence). Unknown pixels
+    # never enter the alpha-mask / alpha-outside terms; with this on they are
+    # also left out of the masked/composite RGB loss (the GT there is the
+    # mask's guess too). Plain masks: every pixel known, nothing changes.
+    mask_unknown_ignore_rgb: bool = True
+    # Depth supervision from measured depth maps (COLMAP CLI: --depth-root).
+    # 0 = off. The render's expected depth (sum w z / sum w, area-pooled onto
+    # the depth map's grid) is compared with the measured depth where the
+    # target is valid, the mask is >= depth_loss_mask_min, the pooled render
+    # opacity is >= depth_alpha_min, and the target has no hole or jump within
+    # depth_edge_px pixels. Frame-normalised like the alpha terms. See
+    # trigs.core.depth for the loss types; huber_log is a relative error
+    # (log-depth), quadratic within +-depth_huber_delta (~ToF noise) and
+    # linear beyond it. When a depth root is given with lambda_depth = 0,
+    # depth is still rendered to log loss/depth and depth/* eval metrics.
+    lambda_depth: float = 0.0
+    depth_loss_start_step: int = 0
+    depth_loss_type: str = "huber_log"
+    depth_huber_delta: float = 0.02
+    depth_loss_mask_min: float = 0.5
+    depth_alpha_min: float = 0.5
+    depth_edge_px: int = 1
+    depth_edge_rel_jump: float = 0.05
+    # World (render) units per metre of measured depth. 1.0 for a metric
+    # COLMAP model (e.g. Kinect-calibrated sparse/0).
+    depth_units_per_metre: float = 1.0
+    # Depth-loss schedule on the cumulative step: lambda_depth until
+    # depth_loss_decay_start_step, then log-linear down to
+    # lambda_depth x depth_loss_final_scale over depth_loss_decay_steps.
+    # final_scale 1.0 (default) = constant weight. Depth then shapes the
+    # geometry early and stops fighting fine photometric detail late.
+    depth_loss_decay_start_step: int = 0
+    depth_loss_decay_steps: int = 0
+    depth_loss_final_scale: float = 1.0
+    # Depth distortion (OPT-IN, 0 = off): penalise the spread of the blending
+    # weights along each ray, sum_ij w_i w_j (z_i - z_j)^2 / mean depth^2,
+    # where the render's opacity >= depth_alpha_min (2DGS-style; see
+    # trigs.core.quality.depth_distortion_loss). Pulls translucent stacks
+    # into one surface. Costs a second rasterization (depth moments) per
+    # rendered camera while active. Frame-normalised; useful lambdas are
+    # large because the term is a squared relative spread (~1e-4 per pixel).
+    lambda_depth_distortion: float = 0.0
+    depth_distortion_start_step: int = 0
+    # Opacity binarisation (OPT-IN, 0 = off): lambda x mean a(1-a) over the
+    # rows active in the step, from opacity_binary_start_step (cumulative
+    # step). Pushes opacities to 0 or 1; meant as a late term.
+    lambda_opacity_binary: float = 0.0
+    opacity_binary_start_step: int = 0
     psnr_eval_every: int = 1000
     psnr_eval_num_samples: int = 48
     psnr_eval_seed: int = 12345
@@ -406,7 +464,13 @@ class TrigsTrainingConfig:
     # can still make the model states drift apart. Unchunked training only
     # (train_chunked rejects it: each chunk call would reseed).
     train_seed: int = -1
+    # psnr/eval_masked weights every pixel by the soft mask (the same mask the
+    # training loss uses; the composite GT is matted with it too).
+    # psnr/eval_interior uses the mask binarised at psnr_mask_threshold and
+    # eroded by psnr_interior_erode_px (image px): the subject without its
+    # matting edge. 0 disables the interior metric.
     psnr_mask_threshold: float = 0.5
+    psnr_interior_erode_px: int = 6
     psnr_clamp_rgb: bool = True
     # Camera positions (0-based, indexing the training camera list) withheld
     # from the training pair stream and evaluated separately. Without this the
@@ -515,6 +579,10 @@ class TrigsTrainingConfig:
         return float(self.rs_readout_ms) > 0.0
 
     # --- Per-camera appearance correction (decouples exposure/WB from timing) ---
+    # render x gain + bias per camera (RGB), in the loss and in psnr/eval_*.
+    # With masked_rgb_composite the bias is premultiplied by the render's
+    # opacity, so the plate stays exactly masked_rgb_bg_color. Held-out
+    # cameras keep gain 1, bias 0 (nothing trains them).
     learn_camera_appearance: bool = False
     lr_camera_appearance: float = 1e-3
     lambda_camera_appearance_reg: float = 1e-2
@@ -1070,8 +1138,11 @@ def _motion_residual_magnitude_loss(
     ).mean()
 
 
-def _as_mask01(mask: Optional[Tensor], shape_hw: tuple[int, int], *, threshold: float = 0.5) -> Optional[Tensor]:
-    """Return mask as float [H,W,1] in {0,1}; None if unavailable."""
+def _as_mask01(mask: Optional[Tensor], shape_hw: tuple[int, int], *, threshold: float | None = 0.5) -> Optional[Tensor]:
+    """Return mask as float [H,W,1] in {0,1}; None if unavailable.
+
+    ``threshold=None`` returns the soft mask clamped to [0, 1] instead.
+    Only channel 0 is the mask (a second channel is its confidence)."""
     if mask is None:
         return None
 
@@ -1093,6 +1164,8 @@ def _as_mask01(mask: Optional[Tensor], shape_hw: tuple[int, int], *, threshold: 
             align_corners=False,
         )[0].permute(1, 2, 0)
 
+    if threshold is None:
+        return m.clamp(0.0, 1.0)
     return (m >= float(threshold)).float()
 
 
@@ -1784,9 +1857,12 @@ class TrigsTrainer:
         return_optimizer_state: bool = False,
         frame_weights: Optional[Sequence[float]] = None,
         progress_bar: Optional[Any] = None,
+        gt_depths_per_frame: Optional[Any] = None,
     ) -> TrigsTrainingResult:
         """``frame_weights`` (aligned with ``frame_indices``) sets the frame choice of every
-        step directly; chunked training uses it to carry the fast-frame top-up into chunk calls."""
+        step directly; chunked training uses it to carry the fast-frame top-up into chunk calls.
+        ``gt_depths_per_frame[frame][cam]`` (metres, [h, w], 0 = invalid) enables depth
+        supervision/metrics (see ``lambda_depth``)."""
         n_primitives = params["means"].shape[0]
 
         # Sequence time bounds for temporal-hierarchy interval clipping.
@@ -1845,6 +1921,7 @@ class TrigsTrainer:
             frame_indices=frame_indices,
             frame_weights_override=frame_weights,
             progress_bar=progress_bar,
+            gt_depths=gt_depths_per_frame,
         )
         result = self._package_result(params, metrics)
         if return_optimizer_state:
@@ -1864,6 +1941,7 @@ class TrigsTrainer:
         gt_times_per_frame: Optional[Dict[int, List[float]]] = None,
         writer: Optional[Any] = None,
         result_device: str | torch.device | None = None,
+        gt_depths_per_frame: Optional[Any] = None,
     ) -> TrigsTrainingResult:
         """Temporally chunked training with seam-safe ownership.
 
@@ -2473,6 +2551,7 @@ class TrigsTrainer:
                     initial_optimizer_step=int(global_step_offset),
                     return_optimizer_state=interleaved,
                     progress_bar=pbar,
+                    gt_depths_per_frame=gt_depths_per_frame,
                     frame_weights=(
                         None if fast_weights is None
                         or all(abs(fast_weights[fi] - 1.0) < 1e-9 for fi in chunk_frames)
@@ -2563,6 +2642,7 @@ class TrigsTrainer:
                     config=config,
                     gt_images_per_frame=gt_images_per_frame,
                     gt_alphas_per_frame=gt_alphas_per_frame,
+                    gt_depths_per_frame=gt_depths_per_frame,
                     gt_times_per_frame=gt_times_per_frame,
                     cull_threshold=cull_threshold,
                     step=global_step_offset,
@@ -3259,7 +3339,14 @@ class TrigsTrainer:
         sh_degree: int,
         config: TrigsTrainingConfig,
         step: int | None = None,
+        with_depth: bool = False,
+        with_moments: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Dict]:
+        """``with_depth`` renders RGB+D: the colours stay the first return
+        value and the accumulated depth sum_i w_i z_i ([1, H, W, 1]) goes to
+        ``info["render_depth_acc"]``. ``with_moments`` adds a second
+        rasterization of (z, z^2) per splat: ``info["render_depth_moments"]``
+        [1, H, W, 2] = (sum w z, sum w z^2), for the depth-distortion term."""
         active_idx = self._active_idx_for_time(params, t, config, step=step)
         if active_idx.numel() == 0:
             # gsplat 1.5.3 divides means.numel() by N * 3 in its native
@@ -3329,7 +3416,28 @@ class TrigsTrainer:
             height=cameras.height_for(cam_idx),
             sh_degree=sh_degree,
             packed=False,
+            **({"render_mode": "RGB+D"} if with_depth else {}),
         )
+        if with_depth:
+            info["render_depth_acc"] = render_colors[..., -1:]
+            render_colors = render_colors[..., :-1]
+        if with_moments:
+            viewmat = cameras.viewmats[cam_idx].to(means_t.dtype)
+            z = means_t @ viewmat[2, :3] + viewmat[2, 3]
+            moments, _, _ = rasterization(
+                means=means_t,
+                quats=quats_t,
+                scales=scales,
+                opacities=effective_opa,
+                colors=torch.stack([z, z * z], dim=-1),
+                viewmats=cameras.viewmats[cam_idx:cam_idx + 1],
+                Ks=cameras.Ks[cam_idx:cam_idx + 1],
+                width=cameras.width_for(cam_idx),
+                height=cameras.height_for(cam_idx),
+                sh_degree=None,
+                packed=False,
+            )
+            info["render_depth_moments"] = moments
 
         if info.get("means2d") is not None and info["means2d"].requires_grad:
             info["means2d"].retain_grad()
@@ -3621,6 +3729,45 @@ class TrigsTrainer:
     # Step 3: Pool-aware relocation
     # -------------------------------------------------------------------------
 
+    def _depth_loss_for_view(
+        self,
+        render_alphas: Tensor,
+        info: Dict,
+        gt_depths_per_frame: Any,
+        gt_alphas_per_frame: Any,
+        frame_idx: int,
+        cam_idx: int,
+        config: TrigsTrainingConfig,
+        with_stats: bool = False,
+    ) -> Optional[tuple[Tensor, Dict[str, Tensor]]]:
+        """Depth loss for one view rendered with ``with_depth=True``; None when
+        that view has no depth map (missing file with error_on_missing off)."""
+        from .depth import depth_supervision
+
+        target = gt_depths_per_frame[frame_idx][cam_idx]
+        if not torch.is_tensor(target):
+            return None
+        mask = None
+        if gt_alphas_per_frame is not None:
+            try:
+                mask_obj = gt_alphas_per_frame[frame_idx][cam_idx]
+            except Exception:
+                mask_obj = None
+            if torch.is_tensor(mask_obj):
+                mask = mask_obj.to(self.device)
+        return depth_supervision(
+            info["render_depth_acc"][0], render_alphas[0], target.to(self.device),
+            mask=mask,
+            loss_type=str(config.depth_loss_type),
+            huber_delta=float(config.depth_huber_delta),
+            mask_min=float(config.depth_loss_mask_min),
+            alpha_min=float(config.depth_alpha_min),
+            edge_px=int(config.depth_edge_px),
+            edge_rel_jump=float(config.depth_edge_rel_jump),
+            target_scale=float(config.depth_units_per_metre),
+            with_stats=with_stats,
+        )
+
     def _photometric_losses(
         self,
         params: nn.ParameterDict,
@@ -3635,8 +3782,11 @@ class TrigsTrainer:
         """RGB, alpha-outside and alpha-mask losses for one rendered camera."""
         pred_color = render_colors[0]
         clamp_for_loss = bool(getattr(config, "clamp_render_for_loss", True))
-        if "cam_gain" in params:
-            pred_color = pred_color * params["cam_gain"][cam_idx] + params["cam_bias"][cam_idx]
+        composite = bool(config.masked_rgb_loss and config.masked_rgb_composite)
+        if "cam_gain" in params and not composite:
+            pred_color = apply_camera_appearance(
+                pred_color, params["cam_gain"][cam_idx], params["cam_bias"][cam_idx],
+            )
 
         if config.masked_rgb_loss:
             mask_obj = gt_alphas_per_frame[frame_idx][cam_idx]
@@ -3645,19 +3795,11 @@ class TrigsTrainer:
                     f"masked_rgb_loss=True but gt_alphas_per_frame did not return a tensor. "
                     f"Got {type(mask_obj)}."
                 )
-            gt_mask = mask_obj.to(self.device).float()
-            if gt_mask.max() > 1.0:
-                gt_mask = gt_mask / 255.0
-            if gt_mask.ndim == 2:
-                gt_mask = gt_mask[..., None]
-            elif gt_mask.ndim == 3 and gt_mask.shape[-1] != 1:
-                gt_mask = gt_mask[..., :1]
-            if tuple(gt_mask.shape[:2]) != tuple(render_colors[0].shape[:2]):
-                gt_mask = F.interpolate(
-                    gt_mask.permute(2, 0, 1).unsqueeze(0),
-                    size=render_colors[0].shape[:2], mode="bilinear", align_corners=False,
-                )[0].permute(1, 2, 0)
-            gt_mask = gt_mask.clamp(0.0, 1.0)
+            gt_mask, known = split_mask_confidence(mask_obj.to(self.device))
+            hw = (int(render_colors.shape[1]), int(render_colors.shape[2]))
+            gt_mask = resize_hw1(gt_mask, hw).clamp(0.0, 1.0)
+            if known is not None:
+                known = resize_hw1(known, hw).clamp(0.0, 1.0)
 
             alpha = render_alphas[0]
             if alpha.ndim == 2:
@@ -3666,6 +3808,12 @@ class TrigsTrainer:
                 alpha = alpha[..., :1]
             alpha = alpha.float().clamp(0.0, 1.0)
             outside = (1.0 - gt_mask).clamp(0.0, 1.0)
+            if "cam_gain" in params and composite:
+                # Bias premultiplied by opacity: the plate stays the plate.
+                pred_color = apply_camera_appearance(
+                    pred_color, params["cam_gain"][cam_idx], params["cam_bias"][cam_idx],
+                    alpha=alpha,
+                )
 
             if config.masked_rgb_composite:
                 # Composite the (premultiplied) render over a constant
@@ -3709,6 +3857,10 @@ class TrigsTrainer:
                     pred_color = pred_color.clamp(0.0, 1.0)
                 pred_for_loss = pred_color * gt_mask + gt_rgb * (1.0 - gt_mask)
                 gt_for_loss = gt_rgb
+            if known is not None and bool(getattr(config, "mask_unknown_ignore_rgb", True)):
+                # Unknown pixels: target = the (detached) prediction, so they
+                # carry no RGB residual.
+                gt_for_loss = gt_for_loss * known + pred_for_loss.detach() * (1.0 - known)
             rgb_loss = reconstruction_loss(
                 pred_for_loss, gt_for_loss, ssim_lambda=config.ssim_lambda,
             )
@@ -3723,11 +3875,13 @@ class TrigsTrainer:
             # cloud. Frame-relative normalization keeps lambda meaning one
             # thing for every camera.
             n_px = float(gt_mask.shape[0] * gt_mask.shape[1])
-            alpha_outside_loss = (alpha * outside).sum() / n_px
+            inside_w = gt_mask if known is None else gt_mask * known
+            outside_w = outside if known is None else outside * known
+            alpha_outside_loss = (alpha * outside_w).sum() / n_px
             alpha_safe = alpha.clamp(config.alpha_loss_eps, 1.0 - config.alpha_loss_eps)
             bce = F.binary_cross_entropy(alpha_safe, gt_mask, reduction="none")
-            inside_bce = (bce * gt_mask).sum() / n_px
-            outside_bce = (bce * outside).sum() / n_px
+            inside_bce = (bce * inside_w).sum() / n_px
+            outside_bce = (bce * outside_w).sum() / n_px
             alpha_mask_loss = 0.5 * (inside_bce + outside_bce)
         else:
             if clamp_for_loss:
@@ -3964,7 +4118,7 @@ class TrigsTrainer:
     def _evaluate_psnr_subset(
         self, *, params, cameras, eval_pairs, sh_degree, config,
         gt_images_per_frame, gt_alphas_per_frame, gt_times_per_frame,
-        step: int,
+        step: int, gt_depths_per_frame=None,
     ) -> Dict[str, float]:
         if not eval_pairs:
             return {}
@@ -3974,20 +4128,32 @@ class TrigsTrainer:
             gt_images_per_frame=gt_images_per_frame,
             gt_alphas_per_frame=gt_alphas_per_frame,
             gt_times_per_frame=gt_times_per_frame, step=step,
+            gt_depths_per_frame=gt_depths_per_frame,
         ))
 
     @torch.no_grad()
     def _psnr_subset_accum(
         self, *, params, cameras, eval_pairs, sh_degree, config,
         gt_images_per_frame, gt_alphas_per_frame, gt_times_per_frame,
-        step: int,
+        step: int, gt_depths_per_frame=None,
     ) -> Dict[str, Any]:
         """Per-pair squared-error sums, so partial evals (one per temporal
-        chunk) combine into exactly the metrics of a single full eval."""
-        sse_full = 0.0; denom_full = 0.0
-        sse_masked = 0.0; denom_masked = 0.0
+        chunk) combine into exactly the metrics of a single full eval.
+        With ``gt_depths_per_frame``, also per-pixel depth errors (a bounded
+        random subsample per pair, so medians merge across chunks)."""
+        sse_full = 0.0
+        denom_full = 0.0
+        sse_masked = 0.0
+        denom_masked = 0.0
+        sse_interior = 0.0
+        denom_interior = 0.0
         image_psnrs_full: List[float] = []
         image_psnrs_masked: List[float] = []
+        depth_abs_m: List[Tensor] = []
+        depth_ratio: List[Tensor] = []
+        depth_n_target = 0
+        depth_n_covered = 0
+        with_depth = gt_depths_per_frame is not None
 
         for frame_idx, cam_idx in eval_pairs:
             t = self._eval_render_time(
@@ -4002,11 +4168,27 @@ class TrigsTrainer:
                 sh_degree,
                 config,
                 step=step,
+                **({"with_depth": True} if with_depth else {}),
             )
-            pred = _as_float_rgb01(render_colors[0].detach(), clamp=config.psnr_clamp_rgb)
-            gt = _as_float_rgb01(gt_images_per_frame[frame_idx][cam_idx].to(self.device),
-                                  clamp=config.psnr_clamp_rgb)
-
+            if with_depth:
+                dres = self._depth_loss_for_view(
+                    render_alphas, info, gt_depths_per_frame, gt_alphas_per_frame,
+                    frame_idx, cam_idx, config, with_stats=True,
+                )
+                if dres is not None:
+                    dstats = dres[1]
+                    depth_n_target += int(dstats["n_target"])
+                    depth_n_covered += int(dstats["n_covered"])
+                    err, ratio = dstats["abs_err"], dstats["ratio"]
+                    if err.numel() > 65536:
+                        gen = torch.Generator(device="cpu").manual_seed(
+                            int(frame_idx) * 1009 + int(cam_idx))
+                        sel = torch.randperm(int(err.numel()), generator=gen)[:65536]
+                        sel = sel.to(err.device)
+                        err, ratio = err[sel], ratio[sel]
+                    depth_abs_m.append(err.float().cpu())
+                    depth_ratio.append(ratio.float().cpu())
+                del dres
             if gt_alphas_per_frame is not None:
                 try:
                     mask_raw = gt_alphas_per_frame[frame_idx][cam_idx].to(self.device)
@@ -4015,14 +4197,43 @@ class TrigsTrainer:
             else:
                 mask_raw = None
 
-            mask = _as_mask01(mask_raw, (pred.shape[0], pred.shape[1]),
-                               threshold=config.psnr_mask_threshold)
+            composite_eval = bool(config.masked_rgb_loss and config.masked_rgb_composite
+                                  and mask_raw is not None)
+            render_rgb = render_colors[0].detach()
+            if "cam_gain" in params:
+                # Score the render the loss sees: with the learned camera
+                # colour correction (bias premultiplied in composite mode).
+                a_cam = render_alphas[0].detach()
+                if a_cam.ndim == 2:
+                    a_cam = a_cam[..., None]
+                render_rgb = apply_camera_appearance(
+                    render_rgb, params["cam_gain"][cam_idx].detach(),
+                    params["cam_bias"][cam_idx].detach(),
+                    alpha=a_cam[..., :1].clamp(0.0, 1.0) if composite_eval else None,
+                )
+            pred = _as_float_rgb01(render_rgb, clamp=config.psnr_clamp_rgb)
+            gt = _as_float_rgb01(gt_images_per_frame[frame_idx][cam_idx].to(self.device),
+                                  clamp=config.psnr_clamp_rgb)
 
-            if (
-                config.masked_rgb_loss
-                and config.masked_rgb_composite
-                and mask is not None
-            ):
+            hw = (pred.shape[0], pred.shape[1])
+            # Soft mask (the training loss's mask) for the masked metric and the
+            # composite GT; binarised + eroded for the interior metric.
+            # Unknown pixels (mask confidence channel) are left out of both.
+            mask = _as_mask01(mask_raw, hw, threshold=None)
+            mask_bin = _as_mask01(mask_raw, hw, threshold=config.psnr_mask_threshold)
+            known = None
+            if mask_raw is not None:
+                _, known = split_mask_confidence(mask_raw)
+                if known is not None:
+                    known = resize_hw1(known, hw)
+            interior = None
+            erode_px = int(getattr(config, "psnr_interior_erode_px", 0))
+            if mask_bin is not None and erode_px > 0:
+                interior = erode_mask(mask_bin, erode_px)
+                if known is not None:
+                    interior = interior * (known >= 0.5).float()
+
+            if composite_eval and mask is not None:
                 # Match the training objective. Without this, psnr/eval_full
                 # compares a premultiplied-over-black render against a GT whose
                 # background is not black, and stays pinned near a constant
@@ -4047,25 +4258,38 @@ class TrigsTrainer:
             diff2 = (pred - gt).double().pow(2)
             sse_i = float(diff2.sum().item())
             denom_i = float(diff2.numel())
-            sse_full += sse_i; denom_full += denom_i
+            sse_full += sse_i
+            denom_full += denom_i
             mse_i = max(sse_i / max(denom_i, 1.0), 1e-12)
             image_psnrs_full.append(float(-10.0 * math.log10(mse_i)))
 
             if mask is not None:
                 mask = mask.to(device=self.device, dtype=torch.float64)
+                if known is not None:
+                    mask = mask * known.to(device=self.device, dtype=torch.float64)
                 denom_m_i = float((mask.sum() * pred.shape[-1]).item())
                 if denom_m_i > 0:
                     sse_m_i = float((diff2 * mask).sum().item())
-                    sse_masked += sse_m_i; denom_masked += denom_m_i
+                    sse_masked += sse_m_i
+                    denom_masked += denom_m_i
                     mse_m_i = max(sse_m_i / max(denom_m_i, 1.0), 1e-12)
                     image_psnrs_masked.append(float(-10.0 * math.log10(mse_m_i)))
+            if interior is not None:
+                interior = interior.to(device=self.device, dtype=torch.float64)
+                denom_in_i = float((interior.sum() * pred.shape[-1]).item())
+                if denom_in_i > 0:
+                    sse_interior += float((diff2 * interior).sum().item())
+                    denom_interior += denom_in_i
 
         return {
             "sse_full": sse_full, "denom_full": denom_full,
             "sse_masked": sse_masked, "denom_masked": denom_masked,
+            "sse_interior": sse_interior, "denom_interior": denom_interior,
             "image_psnrs_full": image_psnrs_full,
             "image_psnrs_masked": image_psnrs_masked,
             "n_pairs": len(eval_pairs),
+            "depth_abs_m": depth_abs_m, "depth_ratio": depth_ratio,
+            "depth_n_target": depth_n_target, "depth_n_covered": depth_n_covered,
         }
 
     @staticmethod
@@ -4078,8 +4302,14 @@ class TrigsTrainer:
         for acc in accums:
             for key in ("sse_full", "denom_full", "sse_masked", "denom_masked", "n_pairs"):
                 merged[key] += acc[key]
+            for key in ("sse_interior", "denom_interior"):
+                merged[key] = merged.get(key, 0.0) + float(acc.get(key, 0.0))
             merged["image_psnrs_full"] += list(acc["image_psnrs_full"])
             merged["image_psnrs_masked"] += list(acc["image_psnrs_masked"])
+            for key in ("depth_abs_m", "depth_ratio"):
+                merged.setdefault(key, []).extend(acc.get(key, []))
+            for key in ("depth_n_target", "depth_n_covered"):
+                merged[key] = merged.get(key, 0) + int(acc.get(key, 0))
         return merged
 
     @staticmethod
@@ -4102,7 +4332,23 @@ class TrigsTrainer:
                 sum(image_psnrs_masked) / max(len(image_psnrs_masked), 1))
             out["mask/eval_pixels_mean"] = float(
                 denom_masked / (3.0 * max(len(image_psnrs_masked), 1)))
+        if float(acc.get("denom_interior", 0.0)) > 0:
+            mse_in = max(float(acc["sse_interior"]) / float(acc["denom_interior"]), 1e-12)
+            out["psnr/eval_interior"] = float(-10.0 * math.log10(mse_in))
         out["psnr/eval_num_samples"] = float(acc["n_pairs"])
+        depth_abs = acc.get("depth_abs_m") or []
+        if depth_abs:
+            err = torch.cat(depth_abs)
+            ratio = torch.cat(acc["depth_ratio"])
+            if err.numel():
+                out["depth/eval_median_abs_mm"] = float(err.median()) * 1000.0
+                out["depth/eval_mean_abs_mm"] = float(err.mean()) * 1000.0
+                out["depth/eval_p90_abs_mm"] = float(torch.quantile(err, 0.9)) * 1000.0
+                out["depth/eval_median_ratio"] = float(ratio.median())
+        if int(acc.get("depth_n_target", 0)) > 0:
+            # Fraction of supervisable target pixels the render covers with
+            # opacity >= depth_alpha_min (the error above is over those).
+            out["depth/eval_coverage"] = float(acc["depth_n_covered"]) / float(acc["depth_n_target"])
         return out
 
     @torch.no_grad()
@@ -4120,6 +4366,7 @@ class TrigsTrainer:
         gt_times_per_frame,
         cull_threshold: float,
         step: int,
+        gt_depths_per_frame=None,
     ) -> Dict[str, Dict[str, float]]:
         """psnr/eval_* (and psnr/holdout_*) for a chunked model.
 
@@ -4182,6 +4429,7 @@ class TrigsTrainer:
                         sh_degree=sh_degree, config=eval_config,
                         gt_images_per_frame=gt_images_per_frame,
                         gt_alphas_per_frame=gt_alphas_per_frame,
+                        gt_depths_per_frame=gt_depths_per_frame,
                         gt_times_per_frame=gt_times_per_frame, step=step,
                     ))
             del sub_params
@@ -4938,6 +5186,7 @@ class TrigsTrainer:
         frame_indices: Optional[List[int]] = None,
         frame_weights_override: Optional[Sequence[float]] = None,
         progress_bar: Optional[Any] = None,
+        gt_depths: Optional[Any] = None,
     ) -> Dict[str, Any]:
         from ..strategy.motion_guided_relocation import (
             MotionGuidedRelocationConfig,
@@ -4946,6 +5195,14 @@ class TrigsTrainer:
 
         gt_images_per_frame = gt_images
         gt_alphas_per_frame = gt_alphas
+        gt_depths_per_frame = gt_depths
+        # Depth is rendered whenever targets exist (lambda 0 still logs
+        # loss/depth for comparison); it only enters the loss when
+        # lambda_depth > 0 and step >= depth_loss_start_step.
+        render_depth = gt_depths_per_frame is not None
+        lambda_depth = float(getattr(config, "lambda_depth", 0.0))
+        if lambda_depth > 0.0 and not render_depth:
+            raise ValueError("lambda_depth > 0 needs depth targets (e.g. --depth-root)")
 
         train_seed = int(getattr(config, "train_seed", -1))
         if train_seed >= 0:
@@ -5323,6 +5580,33 @@ class TrigsTrainer:
             rgb_loss_sum = 0.0
             alpha_outside_sum = 0.0
             alpha_mask_sum = 0.0
+            depth_loss_sum = 0.0
+            depth_views = 0
+            depth_stats_step: List[Dict[str, Tensor]] = []
+            want_depth_stats = (
+                render_depth and writer is not None and config.tb_log_every > 0
+                and step % config.tb_log_every == 0
+            ) or (render_depth and step == 0)
+            depth_in_loss = (
+                render_depth and lambda_depth > 0.0
+                and step >= int(getattr(config, "depth_loss_start_step", 0))
+            )
+            # Opt-in quality terms run on the cumulative step (chunk calls
+            # carry it in sh_warmup_step_offset).
+            global_step = int(step) + max(int(getattr(config, "sh_warmup_step_offset", 0)), 0)
+            lambda_depth_step = lambda_depth * depth_lambda_scale(
+                global_step,
+                int(getattr(config, "depth_loss_decay_start_step", 0)),
+                int(getattr(config, "depth_loss_decay_steps", 0)),
+                float(getattr(config, "depth_loss_final_scale", 1.0)),
+            )
+            lambda_dist = float(getattr(config, "lambda_depth_distortion", 0.0))
+            dist_active = lambda_dist > 0.0 and global_step >= int(
+                getattr(config, "depth_distortion_start_step", 0))
+            lambda_obin = float(getattr(config, "lambda_opacity_binary", 0.0))
+            obin_active = lambda_obin > 0.0 and global_step >= int(
+                getattr(config, "opacity_binary_start_step", 0))
+            dist_loss_sum = 0.0
             gamma = None
             active_parts: List[Tensor] = []
             for group_i, cam_idx in enumerate(cam_group):
@@ -5344,6 +5628,8 @@ class TrigsTrainer:
 
                 render_colors, render_alphas, cam_gamma, cam_info = self._render(
                     params, cameras, cam_idx, t, sh_degree, config, step=step,
+                    **({"with_depth": True} if render_depth else {}),
+                    **({"with_moments": True} if dist_active else {}),
                 )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -5369,6 +5655,29 @@ class TrigsTrainer:
                     + config.lambda_alpha_outside_mask * cam_alpha_out
                     + config.lambda_alpha_mask * cam_alpha_mask
                 )
+                if render_depth:
+                    dres = self._depth_loss_for_view(
+                        render_alphas, cam_info, gt_depths_per_frame, gt_alphas_per_frame,
+                        frame_idx, cam_idx, config, with_stats=want_depth_stats,
+                    )
+                    if dres is not None:
+                        cam_depth, cam_depth_stats = dres
+                        depth_loss_sum += float(cam_depth.detach())
+                        depth_views += 1
+                        if cam_depth_stats:
+                            depth_stats_step.append(cam_depth_stats)
+                        if depth_in_loss:
+                            cam_loss = cam_loss + lambda_depth_step * cam_depth
+                    del dres
+                if dist_active:
+                    mom = cam_info["render_depth_moments"][0]
+                    cam_dist = depth_distortion_loss(
+                        render_alphas[0], mom[..., 0:1], mom[..., 1:2],
+                        alpha_min=float(config.depth_alpha_min),
+                    )
+                    dist_loss_sum += float(cam_dist.detach())
+                    cam_loss = cam_loss + lambda_dist * cam_dist
+                    del mom
                 if cam_loss.requires_grad:
                     (cam_loss / n_group).backward()
 
@@ -5393,6 +5702,31 @@ class TrigsTrainer:
                 del render_colors, render_alphas, cam_info, cam_loss
 
             gamma = gamma / float(n_group)
+            depth_loss = torch.tensor(depth_loss_sum / max(depth_views, 1))
+            if depth_stats_step:
+                with torch.no_grad():
+                    d_err = torch.cat([d["abs_err"].float() for d in depth_stats_step])
+                    d_ratio = torch.cat([d["ratio"].float() for d in depth_stats_step])
+                    n_tgt = sum(int(d["n_target"]) for d in depth_stats_step)
+                    n_cov = sum(int(d["n_covered"]) for d in depth_stats_step)
+                    depth_step_stats = {
+                        "depth/current_median_abs_mm": (
+                            float(d_err.median()) * 1000.0 if d_err.numel() else float("nan")),
+                        "depth/current_median_ratio": (
+                            float(d_ratio.median()) if d_ratio.numel() else float("nan")),
+                        "depth/current_coverage": float(n_cov) / max(float(n_tgt), 1.0),
+                    }
+                    del d_err, d_ratio
+                if step == 0 and config.verbose:
+                    print(
+                        "  Depth check @ step 0 (render/target inside mask): "
+                        f"median ratio={depth_step_stats['depth/current_median_ratio']:.4f}, "
+                        f"median |err|={depth_step_stats['depth/current_median_abs_mm']:.1f} mm, "
+                        f"coverage={depth_step_stats['depth/current_coverage']:.3f}, "
+                        f"loss/depth={float(depth_loss):.5f}"
+                    )
+            else:
+                depth_step_stats = {}
             rgb_loss = torch.tensor(rgb_loss_sum / n_group)
             alpha_outside_loss = torch.tensor(alpha_outside_sum / n_group)
             alpha_mask_loss = torch.tensor(alpha_mask_sum / n_group)
@@ -5401,6 +5735,11 @@ class TrigsTrainer:
                 + config.lambda_alpha_outside_mask * alpha_outside_loss
                 + config.lambda_alpha_mask * alpha_mask_loss
             )
+            if depth_in_loss:
+                photometric_total = photometric_total + lambda_depth_step * depth_loss
+            dist_loss = torch.tensor(dist_loss_sum / n_group)
+            if dist_active:
+                photometric_total = photometric_total + lambda_dist * dist_loss
             step_active_idx = (
                 active_parts[0] if n_group == 1
                 else torch.unique(torch.cat(active_parts))
@@ -5538,6 +5877,18 @@ class TrigsTrainer:
                 params, config,
             )
 
+            if obin_active:
+                obin_rows = step_active_idx
+                if "chunk_train_mask" in params:
+                    # Only rows this chunk may change.
+                    owned = params["chunk_train_mask"].detach().reshape(-1)[obin_rows] > 0.5
+                    obin_rows = obin_rows[owned]
+                opacity_binary_loss = opacity_binarization_loss(
+                    params["opacities"].reshape(-1)[obin_rows]
+                )
+            else:
+                opacity_binary_loss = params["means"].new_zeros(())
+
             reg_total = (
                 config.lambda_motion * motion_loss
                 + lambda_res * motion_residual_loss
@@ -5550,10 +5901,24 @@ class TrigsTrainer:
                 + getattr(config, "lambda_temporal_chunk_outside_mass", 0.0)
                 * chunk_outside_mass_loss
             )
+            if obin_active:
+                reg_total = reg_total + lambda_obin * opacity_binary_loss
             total_loss = reg_total.detach() + photometric_total.to(reg_total.device)
 
             if writer is not None and config.tb_log_every > 0 and step % config.tb_log_every == 0:
                 writer.add_scalar("loss/total", total_loss.item(), step)
+                if lambda_depth > 0.0 and render_depth:
+                    writer.add_scalar("loss/lambda_depth", lambda_depth_step if depth_in_loss else 0.0, step)
+                if dist_active:
+                    writer.add_scalar("loss/depth_distortion", dist_loss.item(), step)
+                if obin_active:
+                    writer.add_scalar("loss/opacity_binary", opacity_binary_loss.item(), step)
+                if "cam_gain" in params:
+                    g = params["cam_gain"].detach().mean(dim=-1)
+                    b = params["cam_bias"].detach().mean(dim=-1)
+                    for ci in range(int(g.shape[0])):
+                        writer.add_scalar(f"camera/gain_{ci}", float(g[ci]), step)
+                        writer.add_scalar(f"camera/bias_{ci}", float(b[ci]), step)
                 writer.add_scalar("loss/rgb", rgb_loss.item(), step)
                 writer.add_scalar("loss/motion", motion_loss.item(), step)
                 writer.add_scalar("loss/motion_residual", motion_residual_loss.item(), step)
@@ -5563,6 +5928,11 @@ class TrigsTrainer:
                 writer.add_scalar("loss/sigma_floor", sigma_floor_loss.item(), step)
                 writer.add_scalar("loss/alpha_outside_mask", alpha_outside_loss.item(), step)
                 writer.add_scalar("loss/alpha_mask", alpha_mask_loss.item(), step)
+                if render_depth and depth_views > 0:
+                    writer.add_scalar("loss/depth", depth_loss.item(), step)
+                    for k, v in depth_step_stats.items():
+                        if math.isfinite(v):
+                            writer.add_scalar(k, v, step)
                 writer.add_scalar(
                     "loss/temporal_chunk_outside_mass",
                     chunk_outside_mass_loss.item(),
@@ -5903,6 +6273,8 @@ class TrigsTrainer:
                     "loss_reg": reg_loss.item(), "loss_sigma_floor": sigma_floor_loss.item(),
                     "loss_chunk_outside_mass": chunk_outside_mass_loss.item(),
                 }
+                if render_depth:
+                    snap["loss_depth"] = float(depth_loss)
                 metrics["snapshots"].append(snap)
                 if hasattr(bar, "set_postfix"):
                     if math.isfinite(psnr_masked):
@@ -5952,6 +6324,7 @@ class TrigsTrainer:
                             config=config,
                             gt_images_per_frame=gt_images_per_frame,
                             gt_alphas_per_frame=gt_alphas_per_frame,
+                            gt_depths_per_frame=gt_depths_per_frame,
                             gt_times_per_frame=gt_times_per_frame,
                             step=step,
                         )
@@ -5971,6 +6344,7 @@ class TrigsTrainer:
                                 config=config,
                                 gt_images_per_frame=gt_images_per_frame,
                                 gt_alphas_per_frame=gt_alphas_per_frame,
+                                gt_depths_per_frame=gt_depths_per_frame,
                                 gt_times_per_frame=gt_times_per_frame,
                                 step=step,
                             )
